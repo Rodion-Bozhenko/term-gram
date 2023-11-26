@@ -8,130 +8,194 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/joho/godotenv"
-	"github.com/mattn/go-runewidth"
 	"github.com/zelenin/go-tdlib/client"
-	"golang.org/x/term"
+)
+
+var tdlibClient *client.Client
+
+type focus uint
+
+const (
+	chatsFocus focus = iota
+	messagesFocus
+)
+
+var (
+	modelStyle = lipgloss.NewStyle().
+			Align(lipgloss.Center, lipgloss.Center).
+			BorderStyle(lipgloss.HiddenBorder())
+	focusedModelStyle = lipgloss.NewStyle().
+				Align(lipgloss.Center, lipgloss.Center).
+				BorderStyle(lipgloss.NormalBorder()).
+				BorderForeground(lipgloss.Color("69"))
 )
 
 type model struct {
-	chats        []*client.Chat
-	chat         string
-	focus        string // left or right
-	windowWidth  int
-	windowHeight int
+	chatListModel    list.Model
+	msgListModel     list.Model
+	chatListItems    []list.Item
+	chats            []*client.Chat
+	currentChatIndex int
+	msgListItems     []list.Item
+	messages         *client.Messages
+	focus            focus
 }
+
+var docStyle = lipgloss.NewStyle().Margin(1, 2)
+
+type item struct {
+	title, desc string
+}
+
+type msgItem struct {
+	title, desc string
+}
+
+func (i item) Title() string       { return i.title }
+func (i item) Description() string { return i.desc }
+func (i item) FilterValue() string { return i.title }
 
 func (m model) Init() tea.Cmd {
 	return nil
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+l":
-			{
-				if m.focus == "right" {
-					break
-				}
-				m.focus = "right"
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		case "tab":
+			if m.focus == chatsFocus {
+				m.focus = messagesFocus
+			} else {
+				m.focus = chatsFocus
 			}
-		case "ctrl+h":
-			{
-				if m.focus == "left" {
-					break
+		case "enter":
+			if m.focus == chatsFocus {
+				m.msgListItems = nil
+				m.msgListModel.SetItems([]list.Item{})
+				m.currentChatIndex = m.chatListModel.Index()
+				currentChat := m.chats[m.currentChatIndex]
+				messages, err := tdlibClient.GetChatHistory(&client.GetChatHistoryRequest{ChatId: currentChat.Id, OnlyLocal: false, Limit: 100})
+				if err != nil {
+					log.Printf("Cannot fetch messages: %s\n", err.Error())
 				}
-				m.focus = "left"
-			}
-		case "ctrl+c":
-			{
-				return m, tea.Quit
+				m.messages = messages
+				for _, msg := range messages.Messages {
+					msgContent := ""
+					switch content := msg.Content.(type) {
+					case *client.MessageText:
+						msgContent = content.Text.Text
+					case *client.MessageAnimatedEmoji:
+						msgContent = content.Emoji
+					case *client.MessageSticker:
+						msgContent = content.Sticker.Emoji
+					case *client.MessageAnimation:
+						msgContent = fmt.Sprintf("Animation %s", content.Caption.Text)
+					case *client.MessagePhoto:
+						msgContent = "Image"
+					case *client.MessageAudio:
+						msgContent = fmt.Sprintf("Audio %s (%d sec)", content.Audio.Title, content.Audio.Duration)
+					case *client.MessageVideo:
+						msgContent = fmt.Sprintf("Video (%d sec), %s", content.Video.Duration, content.Caption.Text)
+					case *client.MessageContactRegistered:
+						msgContent = "Joined Telegram"
+					case *client.MessageCall:
+						msgContent = fmt.Sprintf("Call (%d sec)", content.Duration)
+					}
+					m.msgListItems = append(m.msgListItems, item{title: msgContent})
+				}
+
+				m.msgListModel.SetItems(m.msgListItems)
 			}
 		}
 	case tea.WindowSizeMsg:
+		h, v := docStyle.GetFrameSize()
+		m.chatListModel.SetSize((msg.Width-h)/2, msg.Height-v)
+		m.msgListModel.SetSize((msg.Width-h)/2, msg.Height-v)
 	}
 
-	return m, nil
-}
+	m.msgListModel, cmd = m.msgListModel.Update(msg)
+	m.chatListModel, cmd = m.chatListModel.Update(msg)
 
-func truncateStringToDisplayWidth(s string, maxWidth int) string {
-	width := 0
-	for i, r := range s {
-		rw := runewidth.RuneWidth(r)
-		if width+rw > maxWidth {
-			return s[:i]
-		}
-		width += rw
-	}
-	return s
+	return m, cmd
 }
 
 func (m model) View() string {
-	leftPaneView := "Chats"
-	rightPaneView := m.chat
-	chatListWidth := m.windowWidth / 3
-	chatContentWidth := m.windowWidth - chatListWidth
-
-	if m.focus == "left" {
-		leftPaneView = "[Focused] " + leftPaneView
+	var s string
+	if m.focus == chatsFocus {
+		s += lipgloss.JoinHorizontal(lipgloss.Top, focusedModelStyle.Render(m.chatListModel.View()), modelStyle.Render(m.msgListModel.View()))
 	} else {
-		rightPaneView = "[Focused] " + rightPaneView
+		s += lipgloss.JoinHorizontal(lipgloss.Top, modelStyle.Render(m.chatListModel.View()), focusedModelStyle.Render(m.msgListModel.View()))
 	}
 
-	content := leftPaneView + strings.Repeat(" ", chatListWidth-len(leftPaneView)) + " ▏" + rightPaneView + strings.Repeat(" ", chatContentWidth-len(rightPaneView)) + "\n"
-	for i := 0; i < len(m.chats); i++ {
-		chat := m.chats[i]
-		var leftContent string
-		displayWidth := runewidth.StringWidth(chat.Title)
-
-		if displayWidth > chatListWidth {
-			truncatedTitle := truncateStringToDisplayWidth(chat.Title, chatListWidth)
-			leftContent = truncatedTitle + strings.Repeat(" ", chatListWidth-runewidth.StringWidth(truncatedTitle))
-		} else {
-			leftContent = chat.Title + strings.Repeat(" ", chatListWidth-displayWidth)
-		}
-
-		content += leftContent
-		content += " ▏"
-		content += strconv.Itoa(displayWidth) + " " + strings.Repeat(" ", chatContentWidth-4) + "\n"
-	}
-	return content
-}
-
-func initialModel(chats []*client.Chat) model {
-	termFileDescriptor := int(os.Stdin.Fd())
-
-	width, height, err := term.GetSize(termFileDescriptor)
-
-	if err != nil {
-		width = 100
-		height = 60
-	}
-	return model{
-		chats:        chats,
-		chat:         "Messages",
-		focus:        "left",
-		windowWidth:  width,
-		windowHeight: height - 10,
-	}
+	return s
 }
 
 func main() {
-	tdlibClient := runTelegramClient()
+	tdlibClient = runTelegramClient()
 	chats, err := getChatList(tdlibClient)
 	if err != nil {
 		log.Printf("Error fetching chat list: %s\n", err.Error())
 	}
 
-	p := tea.NewProgram(initialModel(chats))
+	items := make([]list.Item, 0, len(chats))
+	for _, chat := range chats {
+		lastMsg := ""
+		if chat.LastMessage != nil {
+			switch content := chat.LastMessage.Content.(type) {
+			case *client.MessageText:
+				lastMsg = content.Text.Text
+			case *client.MessageAnimatedEmoji:
+				lastMsg = content.Emoji
+			case *client.MessageSticker:
+				lastMsg = content.Sticker.Emoji
+			case *client.MessageAnimation:
+				lastMsg = fmt.Sprintf("Animation %s", content.Caption.Text)
+			case *client.MessagePhoto:
+				lastMsg = "Image"
+			case *client.MessageAudio:
+				lastMsg = fmt.Sprintf("Audio %s (%d sec)", content.Audio.Title, content.Audio.Duration)
+			case *client.MessageVideo:
+				lastMsg = fmt.Sprintf("Video (%d sec), %s", content.Video.Duration, content.Caption.Text)
+			case *client.MessageContactRegistered:
+				lastMsg = "Joined Telegram"
+			case *client.MessageCall:
+				lastMsg = fmt.Sprintf("Call (%d sec)", content.Duration)
+			}
+		}
+		items = append(items, item{title: chat.Title, desc: lastMsg})
+	}
+
+	p := tea.NewProgram(initialModel(items, chats))
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Alas, there's been an error: %v", err)
 		os.Exit(1)
+	}
+}
+
+func initialModel(chatListItems []list.Item, chats []*client.Chat) model {
+	chatList := list.New(chatListItems, list.NewDefaultDelegate(), 0, 0)
+	chatList.Title = "Chats"
+
+	msgList := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
+	msgList.Title = "Messages"
+	return model{
+		chatListModel:    chatList,
+		msgListModel:     msgList,
+		chats:            chats,
+		chatListItems:    chatListItems,
+		currentChatIndex: 0,
+		focus:            chatsFocus,
 	}
 }
 
